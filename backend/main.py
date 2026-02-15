@@ -2,7 +2,6 @@ import os
 import glob
 import uuid
 import multiprocessing
-import time
 import asyncio
 from typing import List
 from concurrent.futures import ProcessPoolExecutor
@@ -20,258 +19,199 @@ from watchdog.events import FileSystemEventHandler
 
 app = FastAPI(title="Viniti Real-Time API")
 
+# --- IMPROVED CORS FOR LOCAL NETWORK TESTING ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows your phone and laptop to communicate
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- GLOBAL STATE ---
 EVENT_DB = load_db()
-WATCH_FOLDER = None 
+WATCH_FOLDER = None
 GALLERY_OPEN = False
-MAIN_LOOP = None # Bridge for Thread -> Async communication
+MAIN_LOOP = None
 
-# --- WEBSOCKET MANAGER (THE TRAFFIC CONTROLLER) ---
+# ---------------- STATUS ----------------
+
+@app.get("/status")
+def get_status():
+    return {"gallery_open": GALLERY_OPEN}
+
+# ---------------- WEBSOCKET MANAGER ----------------
+
 class ConnectionManager:
     def __init__(self):
-        # Stores active connections: [{"ws": websocket, "vector": numpy_array}]
         self.active_connections: List[dict] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        print("🔌 New Client Connected via WebSocket")
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections = [c for c in self.active_connections if c["ws"] != websocket]
-        print("🔌 Client Disconnected")
 
     async def register_user_face(self, websocket: WebSocket, image_bytes: bytes):
-        """ Calculate vector for the connected user and store it in RAM """
+        temp_filename = f"temp_{uuid.uuid4()}.jpg"
         try:
-            # Save temp file to read
-            temp_filename = f"temp_{uuid.uuid4()}.jpg"
             with open(temp_filename, "wb") as f:
                 f.write(image_bytes)
-            
+
             img = face_recognition.load_image_file(temp_filename)
-            # Use Jittering for the reference face too (Higher accuracy)
-            encs = face_recognition.face_encodings(img, num_jitters=10)
-            
+            encs = face_recognition.face_encodings(img, num_jitters=1) # Reduced jitters for speed in live tracking
+
+            if encs:
+                # Disconnect previous registration for this specific socket if it exists
+                self.disconnect(websocket)
+                self.active_connections.append({
+                    "ws": websocket,
+                    "vector": encs[0]
+                })
+                await websocket.send_json({"type": "STATUS", "message": "Live Tracking Active"})
+            else:
+                await websocket.send_json({"type": "ERROR", "message": "No face found"})
+        finally:
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
 
-            if encs:
-                # Store the WebSocket AND their Face Vector
-                self.active_connections.append({
-                    "ws": websocket, 
-                    "vector": encs[0]
-                })
-                await websocket.send_json({"type": "STATUS", "message": "✅ Live Tracking Active"})
-                print(f"👤 User registered for Live Updates. Total users: {len(self.active_connections)}")
-            else:
-                await websocket.send_json({"type": "ERROR", "message": "No face found in selfie"})
-        except Exception as e:
-            print(f"WS Error: {e}")
-
-    async def check_and_notify(self, new_photo_path, new_photo_vector):
-        """ Checks a new photo against ALL connected users """
-        if not self.active_connections:
-            return
-
-        print(f"📡 Checking new photo against {len(self.active_connections)} live users...")
-        
-        STRICT_TOLERANCE = 0.50
-        host = "localhost" # In production, this would be your dynamic IP
-        port = "8000"
-
+    async def check_and_notify(self, new_photo_path, vector, base_url):
         for client in self.active_connections:
-            # Compare New Photo vs Connected User
-            dist = face_recognition.face_distance([client['vector']], new_photo_vector)
-            score = dist[0]
-
-            if score <= STRICT_TOLERANCE:
-                # IT'S A MATCH! PUSH TO PHONE!
-                # We construct the URL dynamically
-                # NOTE: In a real deploy, 'host' needs to be the actual server IP, not localhost
-                url = f"http://{host}:{port}/get-image?path={new_photo_path}"
-                
+            score = face_recognition.face_distance([client["vector"]], vector)[0]
+            if score <= 0.50:
+                # Ensure the URL sent to the user uses the current base_url (Ngrok/Local IP)
+                url = f"{base_url}get-image?path={new_photo_path}"
                 try:
-                    await client['ws'].send_json({
+                    await client["ws"].send_json({
                         "type": "NEW_MATCH",
                         "url": url,
                         "score": float(score)
                     })
-                    print(f"   🔔 Pushed notification to user (Score: {score:.3f})")
-                except:
-                    print("   ⚠️ Failed to push (User might have disconnected)")
+                except Exception:
+                    self.disconnect(client["ws"])
 
 manager = ConnectionManager()
 
-# --- CORE AI FUNCTION ---
+# ---------------- CORE IMAGE PROCESS ----------------
+
 def process_single_image(img_path):
     try:
-        time.sleep(0.5) 
-        img = Image.open(img_path).convert('RGB')
-        img.thumbnail((800, 800)) 
-        img_arr = np.array(img)
-        
-        locs = face_recognition.face_locations(img_arr, number_of_times_to_upsample=1)
-        encodings = face_recognition.face_encodings(img_arr, known_face_locations=locs)
+        img = Image.open(img_path).convert("RGB")
+        img.thumbnail((800, 800))
+        arr = np.array(img)
 
-        if len(encodings) > 0:
-            return {"status": "found", "path": img_path, "vectors": encodings}
+        locs = face_recognition.face_locations(arr)
+        encs = face_recognition.face_encodings(arr, locs)
+
+        if encs:
+            # Convert numpy arrays to lists for JSON storage if needed
+            return {"status": "found", "path": img_path, "vectors": [v.tolist() for v in encs]}
     except Exception as e:
-        print(f"⚠️ Error reading {img_path}: {e}")
+        print(f"Error processing {img_path}: {e}")
     return {"status": "empty"}
 
-# --- WATCHDOG HANDLER ---
+# ---------------- WATCHDOG ----------------
+
 class NewImageHandler(FileSystemEventHandler):
+    def __init__(self, loop, request_origin):
+        self.loop = loop
+        self.request_origin = request_origin
+
     def on_created(self, event):
-        if event.is_directory: return
-        filename = event.src_path
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            
-            if any(entry['path'] == filename for entry in EVENT_DB): return
+        if event.is_directory or not event.src_path.lower().endswith((".jpg", ".jpeg", ".png")):
+            return
 
-            print(f"\n⚡ NEW PHOTO DETECTED: {filename}")
-            res = process_single_image(filename)
-            
-            if res["status"] == "found":
-                if not any(entry['path'] == res['path'] for entry in EVENT_DB):
-                    entry = {
-                        "id": str(uuid.uuid4()),
-                        "path": res["path"],
-                        "vectors": res["vectors"]
-                    }
-                    EVENT_DB.append(entry)
-                    save_db(EVENT_DB)
-                    print(f"   🚀 LIVE ADDED: {os.path.basename(filename)}")
+        res = process_single_image(event.src_path)
+        if res["status"] == "found":
+            entry = {
+                "id": str(uuid.uuid4()),
+                "path": res["path"],
+                "vectors": res["vectors"]
+            }
+            EVENT_DB.append(entry)
+            save_db(EVENT_DB)
 
-                    # --- TRIGGER WEBSOCKET BROADCAST ---
-                    # We need to bridge the Sync Thread (Watchdog) to Async Loop (FastAPI)
-                    if MAIN_LOOP:
-                        # We use the first face found in the photo for notification comparison
-                        # (Ideally, we loop through all faces in the photo, but this works for single-subject photos)
-                        for vector in res["vectors"]:
-                            asyncio.run_coroutine_threadsafe(
-                                manager.check_and_notify(res["path"], vector), 
-                                MAIN_LOOP
-                            )
-                else:
-                    print(f"   🚫 Already indexed.")
+            if self.loop:
+                for v in res["vectors"]:
+                    # Ensure v is a numpy array for comparison
+                    asyncio.run_coroutine_threadsafe(
+                        manager.check_and_notify(res["path"], np.array(v), self.request_origin),
+                        self.loop
+                    )
 
-# --- BACKGROUND THREAD FOR WATCHING ---
-def start_watching(path):
-    event_handler = NewImageHandler()
+def start_watching(path, loop, origin):
     observer = Observer()
-    observer.schedule(event_handler, path, recursive=True)
+    observer.schedule(NewImageHandler(loop, origin), path, recursive=True)
     observer.start()
-    print(f"👀 WATCH MODE ACTIVE: Monitoring {path} for new photos...")
-    try:
-        while True: time.sleep(1)
-    except:
-        observer.stop()
-    observer.join()
 
-# --- EXISTING BULK SCAN ---
-def run_scan(folder_path):
-    print(f"\n📂 STARTING BULK SCAN: {folder_path}")
-    global WATCH_FOLDER
-    WATCH_FOLDER = folder_path 
+# ---------------- BULK SCAN ----------------
 
+def run_scan(folder_path, loop, origin):
     image_files = []
-    for ext in ['**/*.jpg', '**/*.jpeg', '**/*.png', '**/*.JPG']:
+    for ext in ["**/*.jpg", "**/*.jpeg", "**/*.png"]:
         image_files.extend(glob.glob(os.path.join(folder_path, ext), recursive=True))
-    
-    print(f"🔎 Found {len(image_files)} images. Indexing...")
-    new_entries = []
-    cpu_cores = max(1, multiprocessing.cpu_count() - 1)
-    
-    with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
-        results = executor.map(process_single_image, image_files)
-        for res in results:
-            if res["status"] == "found":
-                if not any(e['path'] == res['path'] for e in EVENT_DB):
-                    entry = {
-                        "id": str(uuid.uuid4()),
-                        "path": res["path"],
-                        "vectors": res["vectors"]
-                    }
-                    EVENT_DB.append(entry)
-                    new_entries.append(entry)
 
-    if new_entries:
-        save_db(EVENT_DB)
-        print(f"🎉 Bulk Scan Done! Added {len(new_entries)} new photos.")
-    
-    watch_thread = Thread(target=start_watching, args=(folder_path,), daemon=True)
-    watch_thread.start()
+    with ProcessPoolExecutor() as exe:
+        results = list(exe.map(process_single_image, image_files))
+        for r in results:
+            if r["status"] == "found":
+                EVENT_DB.append({
+                    "id": str(uuid.uuid4()),
+                    "path": r["path"],
+                    "vectors": r["vectors"]
+                })
 
-# --- API ENDPOINTS ---
+    save_db(EVENT_DB)
+    Thread(target=start_watching, args=(folder_path, loop, origin), daemon=True).start()
+
+# ---------------- API ROUTES ----------------
+
 class FolderRequest(BaseModel):
     path: str
 
 @app.post("/scan-folder")
-async def scan_folder(req: FolderRequest, bg_tasks: BackgroundTasks):
-    path = req.path.strip('"')
-    if not os.path.exists(path): raise HTTPException(400, "Folder does not exist")
-    bg_tasks.add_task(run_scan, path)
-    return {"message": "Scanning started!"}
+async def scan_folder(req: FolderRequest, request: Request, bg: BackgroundTasks):
+    origin = str(request.base_url)
+    bg.add_task(run_scan, req.path, MAIN_LOOP, origin)
+    return {"message": "Scanning started"}
 
 @app.get("/all-photos")
-async def get_all_photos(request: Request):
-    if not GALLERY_OPEN: return {"matches": []}
-    host = request.base_url.hostname 
-    port = request.base_url.port
-    matches = [{"url": f"http://{host}:{port}/get-image?path={entry['path']}"} for entry in reversed(EVENT_DB)]
-    return {"matches": matches} 
+async def all_photos(request: Request):
+    base = str(request.base_url)
+    return {"matches": [{"url": f"{base}get-image?path={e['path']}"} for e in EVENT_DB[::-1]]}
 
 @app.post("/search")
-async def search_face(request: Request, file: UploadFile = File(...)):
-    try:
-        img = face_recognition.load_image_file(file.file)
-        user_encs = face_recognition.face_encodings(img, num_jitters=10)
-        if not user_encs: return {"matches": []}
+async def search(request: Request, file: UploadFile = File(...)):
+    img = face_recognition.load_image_file(file.file)
+    enc = face_recognition.face_encodings(img, num_jitters=1) # Reduced for performance
 
-        user_vec = user_encs[0]
-        potential_matches = []
-        host = request.base_url.hostname 
-        port = request.base_url.port
-        STRICT_TOLERANCE = 0.50
+    if not enc:
+        return {"matches": []}
 
-        for entry in EVENT_DB:
-            face_dist = face_recognition.face_distance(entry["vectors"], user_vec)
-            score = np.min(face_dist)
-            if score <= STRICT_TOLERANCE:
-                potential_matches.append({
-                    "score": score,
-                    "path": entry['path'],
-                    "filename": os.path.basename(entry['path'])
-                })
-        
-        potential_matches.sort(key=lambda x: x["score"])
-        final_matches = [{"url": f"http://{host}:{port}/get-image?path={match['path']}"} for match in potential_matches]
-        return {"matches": final_matches}
-    except Exception as e: return {"error": str(e)}
+    user = enc[0]
+    base = str(request.base_url)
+    matches = []
+
+    for e in EVENT_DB:
+        # Convert stored list vectors back to numpy for distance calculation
+        db_vectors = [np.array(v) for v in e["vectors"]]
+        distances = face_recognition.face_distance(db_vectors, user)
+        if any(d <= 0.50 for d in distances):
+            matches.append({"url": f"{base}get-image?path={e['path']}"})
+
+    return {"matches": matches}
 
 @app.get("/get-image")
 async def get_image(path: str):
-    if os.path.exists(path): return FileResponse(path)
-    return HTTPException(404)
+    if os.path.exists(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Image not found")
 
 @app.delete("/reset-db")
-def reset_database():
+def reset_db():
     global EVENT_DB
     EVENT_DB = []
     save_db(EVENT_DB)
-    return {"message": "Reset complete"}
-
-# --- SECURITY ENDPOINTS ---
-@app.get("/status")
-def get_status(): return {"gallery_open": GALLERY_OPEN}
+    return {"message": "reset complete"}
 
 @app.post("/toggle-gallery")
 def toggle_gallery():
@@ -279,29 +219,25 @@ def toggle_gallery():
     GALLERY_OPEN = not GALLERY_OPEN
     return {"gallery_open": GALLERY_OPEN}
 
-# --- NEW: WEBSOCKET ENDPOINT ---
+# ---------------- WEBSOCKET ----------------
+
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def websocket_endpoint(ws: WebSocket):
+    await manager.connect(ws)
     try:
         while True:
-            # 1. Wait for client to send selfie image bytes
-            data = await websocket.receive_bytes()
-            # 2. Register them for live updates
-            await manager.register_user_face(websocket, data)
-            # 3. Keep connection alive
-            while True:
-                await websocket.receive_text() # Just listen for pings
+            data = await ws.receive_bytes()
+            await manager.register_user_face(ws, data)
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(ws)
 
-# --- STARTUP HOOK TO GET ASYNC LOOP ---
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     import uvicorn
+    # 0.0.0.0 is necessary to allow external devices (phones) to connect
     uvicorn.run(app, host="0.0.0.0", port=8000)

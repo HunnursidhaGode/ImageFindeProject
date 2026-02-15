@@ -1,20 +1,13 @@
-//import { defineConfig } from 'vite'
-//import react from '@vitejs/plugin-react'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import basicSsl from "@vitejs/plugin-basic-ssl";
 
-// https://vite.dev/config/
-//export default defineConfig({
-//  plugins: [react()],
-//})
-
-
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-// https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), basicSsl()],
+
   server: {
-    host: true,  // <--- ADD THIS LINE. It forces network access.
-    port: 5173,  // Optional: Keeps the port fixed
+    host: true,
+    https: true,
+    port: 5173
   }
-})
+});

@@ -1,23 +1,29 @@
 import React, { useRef, useState, useCallback, useEffect } from 'react';
 import Webcam from 'react-webcam';
-import { Camera, Search, Video, VideoOff, RefreshCw, Image as ImageIcon, Power, Grid } from 'lucide-react';
+import { Camera, Search, Video, VideoOff, RefreshCw, Image as ImageIcon, Power, Grid, AlertTriangle } from 'lucide-react';
 
-// 1. Added 'isGalleryOpen' to props
 const GuestSearch = ({ onSearch, onViewAll, loading, isGalleryOpen }) => {
   const webcamRef = useRef(null);
   const fileInputRef = useRef(null);
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [error, setError] = useState(null);
+  const [isSecure, setIsSecure] = useState(true);
 
-  // Auto-start camera on mount
+  // 1. Check for Secure Context and auto-start
   useEffect(() => {
+    // Browsers block camera if window.isSecureContext is false (except for localhost)
+    if (!window.isSecureContext) {
+      setIsSecure(false);
+      setError("Security Block: Camera requires HTTPS to work on mobile.");
+    }
     setIsCameraOn(true);
   }, []);
 
+  // 2. Updated constraints: using 'environment' for the back camera (better for scanning)
   const videoConstraints = {
     width: 720,
     height: 720,
-    facingMode: "user"
+    facingMode: "environment" // Changed from "user" to "environment"
   };
 
   const capture = useCallback(async () => {
@@ -80,46 +86,60 @@ const GuestSearch = ({ onSearch, onViewAll, loading, isGalleryOpen }) => {
           {isCameraOn ? "Stop" : "Start"}
         </button>
 
-        {isCameraOn ? (
+        {isCameraOn && isSecure ? (
           <Webcam 
             ref={webcamRef} 
             screenshotFormat="image/jpeg" 
             className="w-full h-full object-cover" 
             videoConstraints={videoConstraints}
-            mirrored={true}
-            onUserMediaError={() => setError("Camera blocked.")}
+            mirrored={false} // Usually false for back camera
+            onUserMediaError={(err) => {
+                console.error(err);
+                setError("Permission Denied: Please check browser settings.");
+            }}
           />
         ) : (
-          <div className="w-full h-full flex flex-col items-center justify-center text-slate-500 bg-slate-900">
-            <VideoOff size={48} className="mb-2 opacity-50" />
-            <p className="text-sm">Camera is Off</p>
-            <button 
-                onClick={toggleCamera}
-                className="mt-4 text-indigo-400 text-xs hover:underline"
-            >
-                Tap to turn on
-            </button>
+          <div className="w-full h-full flex flex-col items-center justify-center text-slate-500 bg-slate-900 p-4">
+            {!isSecure ? (
+                <>
+                    <AlertTriangle size={48} className="mb-2 text-amber-500" />
+                    <p className="text-xs text-slate-300">HTTPS Required</p>
+                    <p className="text-[10px] mt-2 text-slate-500">Camera scanning is blocked on HTTP for mobile.</p>
+                </>
+            ) : (
+                <>
+                    <VideoOff size={48} className="mb-2 opacity-50" />
+                    <p className="text-sm">Camera is Off</p>
+                    <button onClick={toggleCamera} className="mt-4 text-indigo-400 text-xs hover:underline">
+                        Tap to turn on
+                    </button>
+                </>
+            )}
           </div>
         )}
 
         {error && isCameraOn && (
-          <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center text-white p-4 z-10">
-            <p className="text-xs mb-2 text-red-300">Camera Access Denied</p>
-            <button onClick={toggleCamera} className="px-3 py-1 bg-white/10 rounded text-[10px]">Retry</button>
+          <div className="absolute inset-0 bg-black/95 flex flex-col items-center justify-center text-white p-6 z-30">
+            <AlertTriangle className="text-red-500 mb-2" size={32} />
+            <p className="text-xs mb-4 text-red-200 leading-relaxed">{error}</p>
+            <button 
+                onClick={() => window.location.reload()} 
+                className="px-4 py-2 bg-indigo-600 rounded-lg text-xs font-bold"
+            >
+                Refresh Page
+            </button>
           </div>
         )}
       </div>
 
       {/* --- ACTION BUTTONS --- */}
       <div className="w-full max-w-xs space-y-3">
-        
-        {/* 1. Scan Face */}
         <button 
           onClick={capture} 
-          disabled={loading || !isCameraOn || !!error}
+          disabled={loading || !isCameraOn || !!error || !isSecure}
           className={`w-full py-3.5 rounded-xl font-bold flex justify-center items-center gap-2 shadow-lg transition-all active:scale-95 
-            ${!isCameraOn 
-                ? "bg-slate-200 text-slate-400 cursor-not-allowed" 
+            ${(!isCameraOn || !isSecure) 
+                ? "bg-slate-200 text-slate-400 cursor-not-allowed shadow-none" 
                 : "bg-indigo-600 text-white hover:bg-indigo-700"
             }`}
         >
@@ -136,7 +156,6 @@ const GuestSearch = ({ onSearch, onViewAll, loading, isGalleryOpen }) => {
             <div className="flex-grow border-t border-slate-200"></div>
         </div>
 
-        {/* 2. Upload from Gallery */}
         <button 
           onClick={() => fileInputRef.current.click()}
           disabled={loading}
@@ -145,8 +164,6 @@ const GuestSearch = ({ onSearch, onViewAll, loading, isGalleryOpen }) => {
           <ImageIcon size={20} /> Upload from Gallery
         </button>
 
-        {/* 3. NEW: CONDITIONAL VIEW FULL GALLERY BUTTON */}
-        {/* Only visible if Photographer unlocks it */}
         {isGalleryOpen && (
             <div className="pt-2 animate-in fade-in slide-in-from-bottom-2 duration-500">
                 <button 
@@ -157,7 +174,6 @@ const GuestSearch = ({ onSearch, onViewAll, loading, isGalleryOpen }) => {
                 </button>
             </div>
         )}
-
       </div>
     </div>
   );
